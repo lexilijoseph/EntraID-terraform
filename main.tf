@@ -6,17 +6,11 @@ data "azuread_client_config" "current" {}
 resource "azuread_user" "users" {
   for_each = var.users
 
-  display_name        = each.value.display_name
   user_principal_name = each.value.user_principal_name
-  mail_nickname       = each.value.mail_nickname
+  display_name        = each.value.display_name
+  password            = each.value.password
 
-  password                 = var.initial_password
-  force_password_change    = true
-  account_enabled          = true
-
-  owners = [
-    data.azuread_client_config.current.object_id
-  ]
+  account_enabled = true
 }
 
 # Create security group
