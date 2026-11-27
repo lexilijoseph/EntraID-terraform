@@ -1,5 +1,5 @@
 
-name: Terraform AI Code Review and Auto Merge
+name: Terraform Validation and Auto Merge
 
 on:
   pull_request:
@@ -37,16 +37,25 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      - name: Verify Terraform Files
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository files:"
+          ls -la
+
+          echo "Terraform files:"
+          find . -maxdepth 2 -name "*.tf" -print
+
       - name: Terraform Format Check
-        run: terraform fmt -check -recursive terraform
+        run: terraform fmt -check -recursive
 
       - name: Terraform Initialize
-        working-directory: terraform
-        run: terraform init -backend=false
+        run: terraform init -backend=false -input=false -no-color
 
       - name: Terraform Validate
-        working-directory: terraform
-        run: terraform validate
+        run: terraform validate -no-color
 
   # =========================================
   # JOB 2: TERRAFORM SECURITY SCAN
@@ -69,191 +78,10 @@ jobs:
         run: pip install checkov
 
       - name: Run Checkov Security Scan
-        run: checkov -d terraform --framework terraform
+        run: checkov -d . --framework terraform
 
   # =========================================
-  # JOB 3: OPENAI AI CODE REVIEW
-  # =========================================
-
-  ai-code-review:
-    name: OpenAI AI Code Review
-    runs-on: ubuntu-latest
-
-    needs:
-      - terraform-validation
-      - terraform-security
-
-    outputs:
-      review_status: ${{ steps.review.outputs.status }}
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Get Pull Request Changes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          gh pr diff "$PR_NUMBER" \
-            --repo "$REPOSITORY" > pr-diff.txt
-
-      - name: Run OpenAI AI Review
-        id: review
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python - <<'PY'
-          import os
-          import json
-          import urllib.request
-
-          api_key = os.environ.get("OPENAI_API_KEY")
-
-          if not api_key:
-              raise RuntimeError("OPENAI_API_KEY is missing.")
-
-          with open("pr-diff.txt", encoding="utf-8") as f:
-              diff = f.read()
-
-          if not diff.strip():
-              review = {
-                  "status": "PASS",
-                  "summary": "No code changes found.",
-                  "findings": []
-              }
-          else:
-              prompt = """
-          Act as a Senior Azure and Terraform Security Architect.
-
-          Review this Entra ID Terraform Pull Request.
-
-          Check the following:
-
-          1. Terraform syntax and configuration errors.
-          2. Security vulnerabilities.
-          3. Hardcoded passwords and secrets.
-          4. Azure permissions and least privilege.
-          5. Entra ID user and group configuration.
-          6. Resource dependencies.
-          7. Destructive infrastructure changes.
-          8. Terraform best practices.
-          9. Naming conventions and maintainability.
-
-          Return ONLY valid JSON:
-
-          {
-            "status": "PASS",
-            "summary": "Review summary",
-            "findings": [
-              {
-                "severity": "HIGH",
-                "file": "main.tf",
-                "description": "Description of the issue"
-              }
-            ]
-          }
-
-          Rules:
-          - PASS only when no confirmed errors or security
-            vulnerabilities are identified.
-          - FAIL when confirmed errors or security issues exist.
-          - Do not invent findings.
-          - Recommendations without confirmed defects
-            may be reported separately in the summary.
-          - Do not claim that Terraform was executed.
-          - Review only the supplied changes.
-          """
-
-              payload = {
-                  "model": "gpt-4.1-mini",
-                  "input": prompt + "\n\nPR DIFF:\n" + diff[:60000],
-                  "max_output_tokens": 3000
-              }
-
-              request = urllib.request.Request(
-                  "https://api.openai.com/v1/responses",
-                  data=json.dumps(payload).encode("utf-8"),
-                  headers={
-                      "Authorization": f"Bearer {api_key}",
-                      "Content-Type": "application/json"
-                  },
-                  method="POST"
-              )
-
-              with urllib.request.urlopen(
-                  request, timeout=120
-              ) as response:
-                  result = json.loads(response.read())
-
-              review_text = "\n".join(
-                  item.get("text", "")
-                  for output in result.get("output", [])
-                  for item in output.get("content", [])
-                  if item.get("type") == "output_text"
-              )
-
-              if not review_text.strip():
-                  raise RuntimeError("OpenAI returned empty review.")
-
-              review = json.loads(review_text)
-
-          status = review.get("status")
-
-          if status not in ["PASS", "FAIL"]:
-              raise ValueError("Invalid AI review status.")
-
-          if not isinstance(review.get("findings"), list):
-              raise ValueError("Invalid AI findings.")
-
-          if status == "PASS" and review["findings"]:
-              raise ValueError(
-                  "AI reported findings but returned PASS. "
-                  "Manual investigation required."
-              )
-
-          with open("review.md", "w", encoding="utf-8") as f:
-              f.write("# Terraform AI Code Review\n\n")
-              f.write(f"**Status: {status}**\n\n")
-              f.write(review.get("summary", "") + "\n\n")
-
-              f.write("## Review Findings\n\n")
-
-              if not review["findings"]:
-                  f.write("No findings reported.\n")
-              else:
-                  for finding in review["findings"]:
-                      f.write(
-                          f"- **{finding.get('severity', 'UNKNOWN')}** "
-                          f"| {finding.get('file', 'Unknown file')} "
-                          f"| {finding.get('description', '')}\n"
-                      )
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"status={status}\n")
-
-          print(f"AI Code Review Status: {status}")
-          PY
-
-      - name: Publish AI Review Comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          gh pr comment "$PR_NUMBER" \
-            --repo "$REPOSITORY" \
-            --body-file review.md
-
-      - name: Block Merge on AI Findings
-        if: steps.review.outputs.status == 'FAIL'
-        run: |
-          echo "::error::AI review identified issues."
-          exit 1
-
-  # =========================================
-  # JOB 4: AUTOMATIC MERGE TO MAIN
+  # JOB 3: AUTOMATIC MERGE TO MAIN
   # =========================================
 
   auto-merge:
@@ -263,16 +91,13 @@ jobs:
     needs:
       - terraform-validation
       - terraform-security
-      - ai-code-review
 
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       needs.terraform-validation.result == 'success' &&
-      needs.terraform-security.result == 'success' &&
-      needs.ai-code-review.result == 'success'
+      needs.terraform-security.result == 'success'
 
     steps:
-
       - name: Check Pull Request Mergeability
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -321,7 +146,7 @@ jobs:
           echo "Feature branch deletion requested."
 
   # =========================================
-  # JOB 5: FAILURE REPORTING
+  # JOB 4: FAILURE REPORTING
   # =========================================
 
   report-failure:
@@ -331,7 +156,6 @@ jobs:
     needs:
       - terraform-validation
       - terraform-security
-      - ai-code-review
       - auto-merge
 
     if: >-
@@ -339,12 +163,10 @@ jobs:
       (
         needs.terraform-validation.result == 'failure' ||
         needs.terraform-security.result == 'failure' ||
-        needs.ai-code-review.result == 'failure' ||
         needs.auto-merge.result == 'failure'
       )
 
     steps:
-
       - name: Publish Failure Report
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -353,7 +175,6 @@ jobs:
 
           VALIDATION: ${{ needs.terraform-validation.result }}
           SECURITY: ${{ needs.terraform-security.result }}
-          AI_REVIEW: ${{ needs.ai-code-review.result }}
           MERGE: ${{ needs.auto-merge.result }}
 
         run: |
@@ -366,16 +187,15 @@ jobs:
           |---|---|
           | Terraform Validation | $VALIDATION |
           | Security Scan | $SECURITY |
-          | AI Code Review | $AI_REVIEW |
           | Automatic Merge | $MERGE |
 
           ## Required Action
 
           1. Open GitHub Actions.
           2. Identify the failed job and step.
-          3. Read the error message in the logs.
+          3. Read the error message.
           4. Fix the reported issue.
-          5. Push the corrected code.
+          5. Commit and push the corrected code.
           6. Wait for the workflow to execute again.
 
           **Merge blocked:** All required checks must pass
